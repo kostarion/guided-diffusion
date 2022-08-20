@@ -668,14 +668,11 @@ class GaussianDiffusion:
         """       
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
         if inpainting_mode:
-            noised_orig_img = th.sqrt(alpha_bar) * orig_img + \
-                              th.sqrt(1 - alpha_bar) * th.randn_like(x)
-            # noised_orig_img_pil = TF.to_pil_image(noised_orig_img[0].add(1).div(2).clamp(0, 1))
-            # noised_orig_img_pil.save(f'/content/drive/MyDrive/AI/Disco_Diffusion/images_out/InpaintingTest/inpainting_dump/noised_orig_{t[0].item()}.png')
+            # noised_orig_img = th.sqrt(alpha_bar) * orig_img + \
+            #                   th.sqrt(1 - alpha_bar) * th.randn_like(x)
+            noised_orig_img = self.q_sample(orig_img, t)
             x = (1-mask_inpaint) * noised_orig_img + mask_inpaint * x
-            # mixed_x = TF.to_pil_image(x[0].add(1).div(2).clamp(0, 1))
-            # mixed_x.save(f'/content/drive/MyDrive/AI/Disco_Diffusion/images_out/InpaintingTest/inpainting_dump/mixed_x_{t[0].item()}.png')
-
+            
         out_orig = self.p_mean_variance(
             model,
             x,
@@ -915,6 +912,9 @@ class GaussianDiffusion:
                 if inpainting_mode \
                         and i >= self.num_timesteps - skip_timesteps_orig \
                         and not cond_fn_with_grad:
+                    mask_value_thr_t = (i - self.num_timesteps + skip_timesteps_orig + 1) \
+                        / (skip_timesteps_orig - skip_timesteps)
+                    mask_inpaint_t = th.where(mask_inpaint >= mask_value_thr_t, 1.0, 0.0)
                     out = sample_fn(
                         model,
                         img,
@@ -926,7 +926,7 @@ class GaussianDiffusion:
                         eta=eta,
                         inpainting_mode=inpainting_mode,
                         orig_img=init_image,
-                        mask_inpaint=mask_inpaint,
+                        mask_inpaint=mask_inpaint_t,
                     )
                 else:
                     out = sample_fn(
@@ -941,6 +941,7 @@ class GaussianDiffusion:
                     )
                 yield out
                 img = out["sample"]
+                
 
     def plms_sample(
         self,
