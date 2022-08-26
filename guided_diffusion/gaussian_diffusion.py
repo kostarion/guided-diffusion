@@ -871,6 +871,7 @@ class GaussianDiffusion:
 
         indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
 
+
         if init_image is not None:
             my_t = th.ones([shape[0]], device=device, dtype=th.long) * indices[0]
             img = self.q_sample(init_image, my_t, img)
@@ -888,6 +889,7 @@ class GaussianDiffusion:
                                                size=model_kwargs['y'].shape,
                                                device=model_kwargs['y'].device)
             with th.no_grad():
+
                 sample_fn = self.ddim_sample_with_grad if cond_fn_with_grad else self.ddim_sample
                 out = sample_fn(
                     model,
@@ -1002,6 +1004,7 @@ class GaussianDiffusion:
         randomize_class=False,
         cond_fn_with_grad=False,
         order=2,
+     
     ):
         """
         Generate samples from the model using Pseudo Linear Multistep.
@@ -1044,6 +1047,209 @@ class GaussianDiffusion:
         randomize_class=False,
         cond_fn_with_grad=False,
         order=2,
+
+
+    ):
+        """
+        Use PLMS to sample from the model and yield intermediate samples from each
+        timestep of PLMS.
+
+        Same usage as p_sample_loop_progressive().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+
+        if skip_timesteps and init_image is None:
+            init_image = th.zeros_like(img)
+
+        indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
+        
+
+        if init_image is not None:
+            my_t = th.ones([shape[0]], device=device, dtype=th.long) * indices[0]
+            img = self.q_sample(init_image, my_t, img)
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        old_out = None
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            if randomize_class and 'y' in model_kwargs:
+                model_kwargs['y'] = th.randint(low=0, high=model.num_classes,
+                                               size=model_kwargs['y'].shape,
+                                               device=model_kwargs['y'].device)
+            with th.no_grad():
+
+                out = self.plms_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                    cond_fn_with_grad=cond_fn_with_grad,
+                    order=order,
+                    old_out=old_out,
+                )
+                yield out
+                old_out = out
+                img = out["sample"]
+
+    def iplms_sample(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        cond_fn_with_grad=False,
+        order=2,
+        old_out=None,
+    ):
+        """
+        Sample x_{t-1} from the model using Pseudo Linear Multistep.
+
+        Same usage as p_sample().
+        """
+        if not int(order) or not 1 <= order <= 4:
+            raise ValueError('order is invalid (should be int from 1-4).')
+
+        def get_model_output(x, t):
+            with th.set_grad_enabled(cond_fn_with_grad and cond_fn is not None):
+                x = x.detach().requires_grad_() if cond_fn_with_grad else x
+                out_orig = self.p_mean_variance(
+                    model,
+                    x,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    model_kwargs=model_kwargs,
+                )
+                if cond_fn is not None:
+                    if cond_fn_with_grad:
+                        out = self.condition_score_with_grad(cond_fn, out_orig, x, t, model_kwargs=model_kwargs)
+                        x = x.detach()
+                    else:
+                        out = self.condition_score(cond_fn, out_orig, x, t, model_kwargs=model_kwargs)
+                else:
+                    out = out_orig
+
+            # Usually our model outputs epsilon, but we re-derive it
+            # in case we used x_start or x_prev prediction.
+            eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
+            return eps, out, out_orig
+
+        alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        eps, out, out_orig = get_model_output(x, t)
+
+        if order > 0 and old_out is None:
+            # Pseudo Improved Euler
+            old_eps = [eps]
+            mean_pred = out["pred_xstart"] * th.sqrt(alpha_bar_prev) + th.sqrt(1 - alpha_bar_prev) * eps
+            eps_2, _, _ = get_model_output(mean_pred, t - 1)
+            eps_prime = (eps + eps_2) / 2
+            pred_prime = self._predict_xstart_from_eps(x, t, eps_prime)
+            mean_pred = pred_prime * th.sqrt(alpha_bar_prev) + th.sqrt(1 - alpha_bar_prev) * eps_prime
+        else:
+            # Pseudo Linear Multistep (Adams-Bashforth)
+            old_eps = old_out["old_eps"]
+            old_eps.append(eps)
+            cur_order = min(order, len(old_eps))
+            if cur_order == 1:
+                eps_prime = (3/2 * old_eps[-1] - 1/2 * eps)
+            elif cur_order == 2:
+                eps_prime = (3/2 * eps - 1/2 * old_eps[-1])
+            elif cur_order == 3:
+                eps_prime = (23/12 * eps - 16/12 * old_eps[-1] + 5/12 * old_eps[-2])
+            elif cur_order == 4:
+                eps_prime = (55/24 * eps - 59/24 * old_eps[-1] + 37/24 * old_eps[-2] - 9/24 * old_eps[-3])
+            else:
+                raise RuntimeError('cur_order is invalid.')
+            pred_prime = self._predict_xstart_from_eps(x, t, eps_prime)
+            mean_pred = pred_prime * th.sqrt(alpha_bar_prev) + th.sqrt(1 - alpha_bar_prev) * eps_prime
+
+        if len(old_eps) >= order:
+            old_eps.pop(0)
+
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        sample = mean_pred * nonzero_mask + out["pred_xstart"] * (1 - nonzero_mask)
+
+        return {"sample": sample, "pred_xstart": out_orig["pred_xstart"], "old_eps": old_eps}
+
+    def iplms_sample_loop(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        skip_timesteps=0,
+        init_image=None,
+        randomize_class=False,
+        cond_fn_with_grad=False,
+        order=2,
+        
+    ):
+        """
+        Generate samples from the model using Pseudo Linear Multistep.
+
+        Same usage as p_sample_loop().
+        """
+        final = None
+        for sample in self.iplms_sample_loop_progressive(
+            model,
+            shape,
+            noise=noise,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+            progress=progress,
+            skip_timesteps=skip_timesteps,
+            init_image=init_image,
+            randomize_class=randomize_class,
+            cond_fn_with_grad=cond_fn_with_grad,
+            order=order,
+        ):
+            final = sample
+        return final["sample"]
+
+    def iplms_sample_loop_progressive(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        skip_timesteps=0,
+        init_image=None,
+        randomize_class=False,
+        cond_fn_with_grad=False,
+        order=2,
+        
     ):
         """
         Use PLMS to sample from the model and yield intermediate samples from each
@@ -1083,7 +1289,8 @@ class GaussianDiffusion:
                                                size=model_kwargs['y'].shape,
                                                device=model_kwargs['y'].device)
             with th.no_grad():
-                out = self.plms_sample(
+ 
+                out = self.iplms_sample(
                     model,
                     img,
                     t,
@@ -1098,6 +1305,195 @@ class GaussianDiffusion:
                 yield out
                 old_out = out
                 img = out["sample"]
+
+    def IPLMS_to_DDIM_sample_loop_progressive(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        skip_timesteps=0,
+        init_image=None,
+        randomize_class=False,
+        cond_fn_with_grad=False,
+        switch_timestep="half",
+        order=2,
+
+    ):
+        """
+        Use PLMS first, then switch to DDIM mid-render to reduce grainy output.
+
+        Same usage as p_sample_loop_progressive().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+
+        if skip_timesteps and init_image is None:
+            init_image = th.zeros_like(img)
+
+        indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
+
+
+        if init_image is not None:
+            my_t = th.ones([shape[0]], device=device, dtype=th.long) * indices[0]
+            img = self.q_sample(init_image, my_t, img)
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        old_out = None
+
+        if switch_timestep == "half":
+            switch_t = (self.num_timesteps - skip_timesteps)/2
+        elif switch_timestep == "quarter":
+            switch_t = (self.num_timesteps - skip_timesteps)/4
+        else:
+            switch_t = int(switch_timestep)
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            if randomize_class and 'y' in model_kwargs:
+                model_kwargs['y'] = th.randint(low=0, high=model.num_classes,
+                                               size=model_kwargs['y'].shape,
+                                               device=model_kwargs['y'].device)
+            with th.no_grad():
+
+                if t > (switch_t):
+                    out = self.ddim_sample(
+                        model,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                        eta=1,
+                    )
+                    yield out
+                    img = out["sample"]
+                else:
+                    out = self.iplms_sample(
+                        model,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                        cond_fn_with_grad=cond_fn_with_grad,
+                        order=order,
+                        old_out=old_out,
+                    )
+                    yield out
+                    old_out = out
+                    img = out["sample"]
+
+    def PLMS_to_DDIM_sample_loop_progressive(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        skip_timesteps=0,
+        init_image=None,
+        randomize_class=False,
+        cond_fn_with_grad=False,
+        switch_timestep="half",
+        order=2,
+
+    ):
+        """
+        Use IPLMS first, then switch to DDIM mid-render to reduce grainy output.
+
+        Same usage as p_sample_loop_progressive().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+
+        if skip_timesteps and init_image is None:
+            init_image = th.zeros_like(img)
+
+        indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
+
+        if init_image is not None:
+            my_t = th.ones([shape[0]], device=device, dtype=th.long) * indices[0]
+            img = self.q_sample(init_image, my_t, img)
+
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        old_out = None
+
+        if switch_timestep == "half":
+            switch_t = (self.num_timesteps - skip_timesteps)/2
+        elif switch_timestep == "quarter":
+            switch_t = (self.num_timesteps - skip_timesteps)/4
+        else:
+            switch_t = int(switch_timestep)
+
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            if randomize_class and 'y' in model_kwargs:
+                model_kwargs['y'] = th.randint(low=0, high=model.num_classes,
+                                               size=model_kwargs['y'].shape,
+                                               device=model_kwargs['y'].device)
+            with th.no_grad():
+
+                if t > (switch_t):
+                    out = self.ddim_sample(
+                        model,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                        eta=1,
+                    )
+                    yield out
+                    img = out["sample"]
+                else:
+                    out = self.plms_sample(
+                        model,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                        cond_fn_with_grad=cond_fn_with_grad,
+                        order=order,
+                        old_out=old_out,
+                    )
+                    yield out
+                    old_out = out
+                    img = out["sample"]
 
     def _vb_terms_bpd(
         self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
